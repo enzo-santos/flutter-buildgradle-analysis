@@ -115,45 +115,204 @@ def download_repos() -> None:
             logging.debug(f"build.gradle not found for {link}")
 
 
-def build_local_properties_definition_grammar():
-    grammar = petitparser.string.of(
-        "def localProperties = new Properties()\ndef localPropertiesFile = rootProject.file('local.properties')\nif (localPropertiesFile.exists()) {\n  "
+NEW_LINE_GRAMMAR = petitparser.character.of("\n") & petitparser.character.of(" ").star()
+
+T = typing.TypeVar("T")
+
+
+def constant(call: typing.Callable[[], T]) -> T:
+    return call()
+
+
+@constant
+def COMMENT_GRAMMAR():
+    return (
+        petitparser.character.of(" ").star()
+        & petitparser.string.of("//")
+        & petitparser.character.none_of("\n").star()
+        & petitparser.character.of("\n")
     )
-    grammar = grammar & petitparser.string.of("  ").optional()
-    grammar = grammar & petitparser.string.of("localPropertiesFile.")
-    grammar = grammar & (
-        petitparser.string.of("withReader('UTF-8') { reader ->\n")
-        | petitparser.string.of("withInputStream { stream ->\n")
+
+
+@constant
+def OLD_PLUGINS_DECLARATION_GRAMMAR():
+    """
+    Parses the old `plugins` declaration.
+
+    The old `plugins` declaration can appear on *build.gradle* as
+
+    ```groovy
+    plugins {
+        id "com.android.application"
+        id 'com.google.gms.google-services'
+        id "kotlin-android"
+        id "dev.flutter.flutter-gradle-plugin"
+    }
+    ```
+    """
+    plugin_declaration_grammar = (
+        petitparser.string.of("id ")
+        & petitparser.character.any_of("'\"")
+        & petitparser.character.none_of("'\"").plus()
+        & petitparser.character.any_of("'\"")
     )
-    grammar = grammar & petitparser.string.of("    ").optional()
-    grammar = grammar & petitparser.string.of("    ").optional()
-    grammar = grammar & petitparser.string.of("localProperties.load(")
-    grammar = grammar & (
-        petitparser.string.of("reader") | petitparser.string.of("stream")
+
+    return (
+        petitparser.string.of("plugins {")
+        & NEW_LINE_GRAMMAR
+        & (plugin_declaration_grammar & NEW_LINE_GRAMMAR).plus()
+        & petitparser.string.of("}\n")
     )
-    grammar = grammar & petitparser.string.of(")\n  ")
-    grammar = grammar & petitparser.string.of("  ").optional()
-    grammar = grammar & petitparser.string.of("}\n}")
-    return grammar
+
+
+@typing.overload
+def build_flutter_property_grammar(name: str, key: str):
+    ...
+
+
+@typing.overload
+def build_flutter_property_grammar(name: str, key: str, label: str, description: str):
+    ...
+
+
+def build_flutter_property_grammar(name: str, key: str, *args: str):
+    if args:
+        label, description = args
+        body_grammar = (
+            petitparser.string.of("throw")
+            & petitparser.string.of(" new").optional()
+            & petitparser.string.of(" ")
+            & (
+                petitparser.string.of("GradleException")
+                | petitparser.string.of("FileNotFoundException")
+            )
+            & petitparser.string.of(
+                f'("{label} not found. Define {description.format(key)} in the local.properties file.")'
+            )
+        )
+    else:
+        body_grammar = (
+            petitparser.string.of(f"{name} = ")
+            & petitparser.character.any_of("'\"")
+            & petitparser.character.none_of("'\"").plus()
+            & petitparser.character.any_of("'\"")
+        )
+
+    return (
+        petitparser.string.of(f"def {name} = localProperties.getProperty('{key}')")
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of(f"if ({name} == null) {{")
+        & NEW_LINE_GRAMMAR
+        & body_grammar
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of("}\n")
+    )
+
+
+def build_properties_file_load_grammar(variable: str, file_variable: str, name: str):
+    return (
+        petitparser.string.of(f"def {variable} = new Properties()")
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of(f"def {file_variable} = rootProject.file('{name}')")
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of(f"if ({file_variable}.exists()) {{")
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of(f"{file_variable}.")
+        & (
+            petitparser.string.of("withReader('UTF-8') { reader ->")
+            | petitparser.string.of("withInputStream { stream ->")
+        )
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of(f"{variable}.load(")
+        & (petitparser.string.of("reader") | petitparser.string.of("stream"))
+        & petitparser.string.of(")")
+        & NEW_LINE_GRAMMAR
+        & petitparser.string.of("}\n}\n")
+    )
+
+
+class Section(typing.NamedTuple):
+    grammar: petitparser.parser.Parser[str]
+    is_persistent: bool
+    is_required: bool
 
 
 def main() -> None:
-    download_repos()
+    # download_repos()
 
-    comment_regexp = re.compile(r"^\s*//")
-    for fpath in glob.glob("build/files/*.build.gradle"):
-        grammars = [build_local_properties_definition_grammar()]
+    for fpath in map(os.path.normpath, glob.glob("build/files/*.build.gradle")):
+        sections: dict[str, Section] = {
+            "comment": Section(
+                grammar=COMMENT_GRAMMAR,
+                is_persistent=True,
+                is_required=False,
+            ),
+            "newline": Section(
+                grammar=petitparser.character.of("\n").plus(),
+                is_persistent=True,
+                is_required=False,
+            ),
+            "old_plugins": Section(
+                grammar=OLD_PLUGINS_DECLARATION_GRAMMAR,
+                is_persistent=False,
+                is_required=False,
+            ),
+            "localProperties": Section(
+                grammar=build_properties_file_load_grammar(
+                    "localProperties", "localPropertiesFile", "local.properties"
+                ),
+                is_persistent=False,
+                is_required=True,
+            ),
+            "keystoreProperties": Section(
+                grammar=build_properties_file_load_grammar(
+                    "keystoreProperties", "keystorePropertiesFile", "key.properties"
+                ),
+                is_persistent=False,
+                is_required=False,
+            ),
+            "flutterRoot": Section(
+                grammar=build_flutter_property_grammar(
+                    "flutterRoot",
+                    "flutter.sdk",
+                    "Flutter SDK",
+                    "location with {}",
+                ),
+                is_persistent=False,
+                is_required=True,
+            ),
+        }
         with open(fpath, encoding="utf-8") as f:
             text = f.read()
-            grammar = grammars[0].token()
-            result = grammar.parse(text)
-            if result.is_success:
-                token = result.value
-                print("matched:", text[token.start : token.stop])
-                continue
-            return
 
-        print(fpath)
+            sections_found: list[str] = []
+            while not sections_found or not all(
+                (section := sections[section_id]).is_persistent
+                or not section.is_required
+                for section_id in (set(sections.keys()) - set(sections_found))
+            ):
+                found = False
+                for section_id, section in sections.items():
+                    result = section.grammar.token().parse(text)
+                    if not result.is_success:
+                        # print(fpath, section_id, result.message, f"{text[:30]!r}")
+                        continue
+                    token = result.value
+                    text = text[token.stop :]
+                    sections_found.append(section_id)
+                    found = True
+                    break
+
+                if not found:
+                    # print(fpath)
+                    break
+
+
+
+
+
+
+            print(fpath, sections_found)
 
 
 if __name__ == "__main__":
